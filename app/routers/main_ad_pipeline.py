@@ -6,6 +6,8 @@ import json
 import traceback
 import mimetypes
 from pathlib import Path
+import tempfile
+import urllib.request
 
 from fastapi import UploadFile
 from dotenv import load_dotenv
@@ -38,7 +40,7 @@ ADSET_STATUS = "ACTIVE"     # or "PAUSED"
 AD_STATUS = "ACTIVE"        # or "PAUSED"
 
 
-# ---------------- DEBUG HELPERS ----------------
+# ---------------- HELPERS ----------------
 def _to_jsonable(obj):
     if obj is None:
         return None
@@ -84,7 +86,6 @@ def log_error(step: str, e: Exception) -> None:
     print("!!!! END ERROR !!!!\n")
 
 
-# ---------------- CONSOLE PROMPTS ----------------
 def choose_asset_mode_console() -> str:
     print("\nChoose ad asset type:")
     print("  1) Reel / Video")
@@ -167,6 +168,18 @@ def prompt_carousel_paths(allow_video: bool) -> list[str]:
     return paths
 
 
+def download_url_to_tempfile(url: str, suffix: str = ".jpg") -> str:
+    """
+    Downloads a public URL to a local temp file and returns the file path.
+    Used to convert thumbnail_url -> image_path for upload_ad_image(image_path=...).
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.close()
+    urllib.request.urlretrieve(url, tmp.name)
+    return tmp.name
+
+
+# ---------------- MAIN ----------------
 def main() -> None:
     # ---------- Resolve meta_user_id / page_id / ig_actor_id from DB ----------
     reader = MetaTokenDbReader(database_url=DATABASE_URL, fernet_key=FERNET_KEY)
@@ -228,19 +241,14 @@ def main() -> None:
 
     # ---------- Choose asset ----------
     mode = choose_asset_mode_console()
-    # targeting: carousel is treated as "image" placement-wise; mixed carousel also uses image placements
     asset_type = "video" if mode == "video" else "image"
     log_response("CHOICE asset_type", {"mode": mode, "asset_type": asset_type})
 
     # STEP 3
     try:
         print("STEP 3: Create adset")
-        # IMPORTANT:
-        # - create_adset signature stays (index, status, asset_type)
-        # - budget/title/link are stored on the adset object AFTER creation (no kwargs)
         adset = ads.create_adset(INDEX, status=ADSET_STATUS, asset_type=asset_type)
 
-        # Store user-entered values on schema (local state)
         adset.daily_budget = int(daily_budget)
         adset.title = str(title)
         adset.link = str(final_link)
@@ -347,15 +355,15 @@ def main() -> None:
     elif mode == "carousel_images":
         try:
             raw_paths = prompt_carousel_paths(allow_video=False)
-            valid_paths: list[Path] = []
+            valid_image_paths: list[Path] = []
             for p in raw_paths:
                 pp = Path(p)
                 if not pp.exists():
                     raise FileNotFoundError(f"Carousel image not found: {p}")
                 if not is_image_path(pp):
                     raise ValueError(f"Carousel images only. Not an image: {p}")
-                valid_paths.append(pp)
-            log_response("STEP 4 carousel_paths", [str(p) for p in valid_paths])
+                valid_image_paths.append(pp)
+            log_response("STEP 4 carousel_paths", [str(p) for p in valid_image_paths])
         except Exception as e:
             log_error("STEP 4", e)
             return
@@ -363,11 +371,11 @@ def main() -> None:
         try:
             print("STEP 5: Upload carousel images to Meta (multipart local files)")
             hashes: list[str] = []
-            for i, p in enumerate(valid_paths, start=1):
+            for i, p in enumerate(valid_image_paths, start=1):
                 try:
                     h = ads.upload_ad_image(adset_index=INDEX, image_path=str(p))
                     hashes.append(h)
-                    print(f"  uploaded {i}/{len(valid_paths)} -> {h}")
+                    print(f"  uploaded {i}/{len(valid_image_paths)} -> {h}")
                 except Exception as inner:
                     raise RuntimeError(f"Failed uploading carousel image {p.name}: {inner}") from inner
             log_response("STEP 5 carousel_image_hashes", hashes)
@@ -376,16 +384,20 @@ def main() -> None:
             return
 
         try:
-            print("STEP 6: Create IG carousel ad creative + paid ad")
-            # NOTE: ads_stairway must implement create_paid_ig_carousel_ad(image_hashes=...)
-            ad_result = ads.create_paid_ig_carousel_ad(
+            print("STEP 6: Create IG carousel ad creative + paid ad (via mixed wrapper)")
+            child_attachments = [
+                {"name": f"Card {i}", "link": final_link, "image_hash": h}
+                for i, h in enumerate(hashes, start=1)
+            ]
+
+            ad_result = ads.create_paid_ig_mixed_carousel_ad(
                 adset_index=INDEX,
                 ad_name=title,
-                image_hashes=hashes,
+                child_attachments=child_attachments,
                 status=AD_STATUS,
                 link_url=final_link,
             )
-            log_response("STEP 6 create_paid_ig_carousel_ad()", ad_result)
+            log_response("STEP 6 create_paid_ig_mixed_carousel_ad()", ad_result)
         except Exception as e:
             log_error("STEP 6", e)
             return
@@ -396,15 +408,15 @@ def main() -> None:
     else:
         try:
             raw_paths = prompt_carousel_paths(allow_video=True)
-            valid_paths: list[Path] = []
+            valid_media_paths: list[Path] = []
             for p in raw_paths:
                 pp = Path(p)
                 if not pp.exists():
                     raise FileNotFoundError(f"Carousel item not found: {p}")
                 if not (is_image_path(pp) or is_video_path(pp)):
                     raise ValueError(f"Unsupported carousel item type (image/video only): {p}")
-                valid_paths.append(pp)
-            log_response("STEP 4 carousel_media_paths", [str(p) for p in valid_paths])
+                valid_media_paths.append(pp)
+            log_response("STEP 4 carousel_media_paths", [str(p) for p in valid_media_paths])
         except Exception as e:
             log_error("STEP 4", e)
             return
@@ -413,18 +425,14 @@ def main() -> None:
             print("STEP 5: Upload carousel media (images + video)")
             child_attachments: list[dict] = []
 
-            for i, p in enumerate(valid_paths, start=1):
+            for i, p in enumerate(valid_media_paths, start=1):
                 try:
                     if is_image_path(p):
                         h = ads.upload_ad_image(adset_index=INDEX, image_path=str(p))
-                        child_attachments.append(
-                            {"name": f"Card {i}", "link": final_link, "image_hash": h}
-                        )
-                        print(f"  uploaded image {i}/{len(valid_paths)} -> {h}")
+                        child_attachments.append({"name": f"Card {i}", "link": final_link, "image_hash": h})
+                        print(f"  uploaded image {i}/{len(valid_media_paths)} -> {h}")
 
                     else:
-                        # Upload video to Meta (must exist in AdsStairway; if not, add it or reuse upload_ad_video() via ngrok)
-                        # Strategy: use save_ad_media to host video, then upload_ad_video(file_url)
                         with open(p, "rb") as f:
                             upload_file = UploadFile(filename=p.name, file=f)
                             media = save_ad_media(upload_file)
@@ -438,18 +446,19 @@ def main() -> None:
 
                         vid = ads.upload_ad_video(adset_index=INDEX, video_url=video_url)
 
-                        # Upload thumb as an adimage so video card has image_hash
-                        thumb_hash = ads.upload_ad_image(adset_index=INDEX, image_url=thumb_url)
+                        # Convert thumb_url -> local file -> upload_ad_image(image_path=...)
+                        thumb_tmp_path = download_url_to_tempfile(thumb_url, suffix=".jpg")
+                        thumb_hash = ads.upload_ad_image(adset_index=INDEX, image_path=thumb_tmp_path)
 
                         child_attachments.append(
                             {
                                 "name": f"Card {i}",
                                 "link": final_link,
                                 "video_id": vid,
-                                "image_hash": thumb_hash,  # IMPORTANT: required for carousel cards
+                                "image_hash": thumb_hash,
                             }
                         )
-                        print(f"  uploaded video {i}/{len(valid_paths)} -> {vid} (thumb_hash={thumb_hash})")
+                        print(f"  uploaded video {i}/{len(valid_media_paths)} -> {vid} (thumb_hash={thumb_hash})")
 
                 except Exception as inner:
                     raise RuntimeError(f"Failed uploading carousel media {p.name}: {inner}") from inner
@@ -462,7 +471,6 @@ def main() -> None:
 
         try:
             print("STEP 6: Create IG mixed carousel creative + paid ad")
-            # NOTE: AdsStairway must implement create_paid_ig_mixed_carousel_ad(child_attachments=...)
             ad_result = ads.create_paid_ig_mixed_carousel_ad(
                 adset_index=INDEX,
                 ad_name=title,

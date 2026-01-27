@@ -6,7 +6,8 @@ load_dotenv()
 
 import os
 from pathlib import Path
-from starlette.datastructures import UploadFile as StarletteUploadFile
+
+from fastapi import UploadFile
 
 from app.routers.ngrok_media_manager import (
     save_organic_video,
@@ -22,7 +23,7 @@ from app.routers.organic_poster import (
     publish_carousel_instagram,
 )
 from app.routers.meta_token_db_reader import MetaTokenDbReader
-from app.models.schemas import OrganicPost
+from app.models.schemas import OrganicPost, CarouselItem
 
 
 # ---------------- CONFIG ----------------
@@ -66,13 +67,21 @@ def prompt_asset_type() -> str:
         print("Invalid choice. Please select 1, 2, or 3.")
 
 
+def _ext_is_video(ext: str) -> bool:
+    return ext in {".mp4", ".mov", ".m4v"}
+
+
+def _ext_is_image(ext: str) -> bool:
+    return ext in {".jpg", ".jpeg", ".png", ".webp"}
+
+
 # ---------------- MAIN ----------------
 def main() -> None:
     reader = MetaTokenDbReader(database_url=DATABASE_URL, fernet_key=FERNET_KEY)
 
     # ---------- Resolve page_id from DB ----------
     meta_page = reader.get_latest_meta_page_for_client(CLIENT_ID)
-    page_id = meta_page.get("page_id")
+    page_id = (meta_page or {}).get("page_id")
     if not page_id:
         raise RuntimeError("No page_id found for this client in DB.")
 
@@ -89,11 +98,14 @@ def main() -> None:
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         with open(video_path, "rb") as f:
-            upload_file = StarletteUploadFile(
+            upload_file = UploadFile(
                 filename=os.path.basename(video_path),
                 file=f,
             )
             organic_post = save_organic_video(title, upload_file)
+
+        if organic_post.video_url is None:
+            raise RuntimeError("save_organic_video() returned no video_url")
 
         print(f"[ngrok] Video URL: {organic_post.video_url}")
 
@@ -110,11 +122,14 @@ def main() -> None:
             raise FileNotFoundError(f"Image not found: {image_path}")
 
         with open(image_path, "rb") as f:
-            upload_file = StarletteUploadFile(
+            upload_file = UploadFile(
                 filename=os.path.basename(image_path),
                 file=f,
             )
             organic_post = save_organic_image(title, upload_file)
+
+        if organic_post.image_url is None:
+            raise RuntimeError("save_organic_image() returned no image_url")
 
         print(f"[ngrok] Image URL: {organic_post.image_url}")
 
@@ -129,7 +144,8 @@ def main() -> None:
         print("\nCarousel setup:")
         print("Enter paths to images/videos. Leave empty to finish.")
 
-        items = []
+        items: list[CarouselItem] = []
+
         while True:
             path = input("Media path: ").strip()
             if not path:
@@ -140,19 +156,28 @@ def main() -> None:
                 continue
 
             ext = Path(path).suffix.lower()
-            media_type = "video" if ext in {".mp4", ".mov"} else "image"
+            if not (_ext_is_image(ext) or _ext_is_video(ext)):
+                print("Unsupported file type. Use images (.jpg/.png/.webp) or videos (.mp4/.mov/.m4v).")
+                continue
 
             with open(path, "rb") as f:
-                upload_file = StarletteUploadFile(
+                upload_file = UploadFile(
                     filename=os.path.basename(path),
                     file=f,
                 )
-                if media_type == "video":
-                    post_part = save_organic_video("", upload_file)
-                    items.append({"type": "video", "url": post_part.video_url})
+
+                if _ext_is_video(ext):
+                    part = save_organic_video("", upload_file)
+                    video_url = part.video_url
+                    if video_url is None:
+                        raise RuntimeError("save_organic_video() returned no video_url")
+                    items.append(CarouselItem(type="video", url=video_url))
                 else:
-                    post_part = save_organic_image("", upload_file)
-                    items.append({"type": "image", "url": post_part.image_url})
+                    part = save_organic_image("", upload_file)
+                    image_url = part.image_url
+                    if image_url is None:
+                        raise RuntimeError("save_organic_image() returned no image_url")
+                    items.append(CarouselItem(type="image", url=image_url))
 
         if len(items) < 2:
             raise RuntimeError("Carousel requires at least 2 items.")
