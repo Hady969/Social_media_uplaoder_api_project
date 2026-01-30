@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import json
 import traceback
-import mimetypes
 from pathlib import Path
 import tempfile
 import urllib.request
@@ -14,7 +13,7 @@ from dotenv import load_dotenv
 
 from app.models.ads_stairway import AdsStairway
 from app.routers.meta_token_db_reader import MetaTokenDbReader
-from app.routers.ngrok_media_manager import save_ad_media
+from app.utils.spaces_uploader import SpacesMediaManager
 
 load_dotenv()
 
@@ -22,7 +21,7 @@ load_dotenv()
 VIDEO_PATH = r"C:\Users\User\Desktop\Ig_Reels\istockphoto-2097298327-640_adpp_is.mp4"
 IMAGE_PATH = r"C:\Users\User\Pictures\example.jpg"
 
-CLIENT_ID = os.environ["CLIENT_ID"]  # tenant selector
+CLIENT_ID = os.environ["CLIENT_ID"]
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v17.0")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -34,10 +33,9 @@ INDEX = 0
 
 DEFAULT_LINK_URL = os.getenv("DEFAULT_AD_LINK_URL", "https://www.instagram.com/")
 
-# Status controls
-CAMPAIGN_STATUS = "ACTIVE"  # or "PAUSED"
-ADSET_STATUS = "ACTIVE"     # or "PAUSED"
-AD_STATUS = "ACTIVE"        # or "PAUSED"
+CAMPAIGN_STATUS = "ACTIVE"
+ADSET_STATUS = "ACTIVE"
+AD_STATUS = "ACTIVE"
 
 
 # ---------------- HELPERS ----------------
@@ -50,13 +48,12 @@ def _to_jsonable(obj):
         return [_to_jsonable(x) for x in obj]
     if isinstance(obj, dict):
         return {str(k): _to_jsonable(v) for k, v in obj.items()}
-
-    if hasattr(obj, "model_dump"):  # pydantic v2
+    if hasattr(obj, "model_dump"):
         try:
             return obj.model_dump()
         except Exception:
             pass
-    if hasattr(obj, "dict"):  # pydantic v1
+    if hasattr(obj, "dict"):
         try:
             return obj.dict()
         except Exception:
@@ -67,6 +64,15 @@ def _to_jsonable(obj):
         except Exception:
             pass
     return repr(obj)
+
+
+def dbg(tag: str, payload) -> None:
+    try:
+        print(f"\n[PIPELINE DBG] {tag}")
+        print(json.dumps(_to_jsonable(payload), indent=2, ensure_ascii=False))
+        print("[/PIPELINE DBG]\n")
+    except Exception:
+        print(f"\n[PIPELINE DBG] {tag}: {payload!r}\n[/PIPELINE DBG]\n")
 
 
 def log_response(step: str, resp) -> None:
@@ -138,13 +144,11 @@ def normalize_link(link: str) -> str:
 
 
 def is_image_path(p: Path) -> bool:
-    ext = p.suffix.lower()
-    return ext in {".jpg", ".jpeg", ".png", ".webp"}
+    return p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def is_video_path(p: Path) -> bool:
-    ext = p.suffix.lower()
-    return ext in {".mp4", ".mov", ".m4v"}
+    return p.suffix.lower() in {".mp4", ".mov", ".m4v"}
 
 
 def prompt_carousel_paths(allow_video: bool) -> list[str]:
@@ -169,10 +173,6 @@ def prompt_carousel_paths(allow_video: bool) -> list[str]:
 
 
 def download_url_to_tempfile(url: str, suffix: str = ".jpg") -> str:
-    """
-    Downloads a public URL to a local temp file and returns the file path.
-    Used to convert thumbnail_url -> image_path for upload_ad_image(image_path=...).
-    """
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.close()
     urllib.request.urlretrieve(url, tmp.name)
@@ -181,7 +181,6 @@ def download_url_to_tempfile(url: str, suffix: str = ".jpg") -> str:
 
 # ---------------- MAIN ----------------
 def main() -> None:
-    # ---------- Resolve meta_user_id / page_id / ig_actor_id from DB ----------
     reader = MetaTokenDbReader(database_url=DATABASE_URL, fernet_key=FERNET_KEY)
 
     meta_user = reader.get_latest_meta_user_for_client(CLIENT_ID)
@@ -204,7 +203,6 @@ def main() -> None:
             "Run token_uploader_console.py and ensure the selected Page is linked to an IG Business account."
         )
 
-    # ---------- Init Ads manager ----------
     ads = AdsStairway(
         database_url=DATABASE_URL,
         encryption_key=FERNET_KEY,
@@ -214,6 +212,8 @@ def main() -> None:
         instagram_actor_id=str(ig_actor_id),
         graph_version=GRAPH_API_VERSION,
     )
+
+    media_mgr = SpacesMediaManager()
 
     # STEP 1
     try:
@@ -233,13 +233,11 @@ def main() -> None:
         log_error("STEP 2", e)
         return
 
-    # ---------- Always prompt (budget/title/link) ----------
     daily_budget = prompt_int(1000, "Daily budget")
     title = prompt_text("Check this out!", "Ad title")
     link = prompt_text("youtube.com", "Redirect link")
     final_link = normalize_link(link)
 
-    # ---------- Choose asset ----------
     mode = choose_asset_mode_console()
     asset_type = "video" if mode == "video" else "image"
     log_response("CHOICE asset_type", {"mode": mode, "asset_type": asset_type})
@@ -254,6 +252,7 @@ def main() -> None:
         adset.link = str(final_link)
 
         log_response("STEP 3 create_adset()", adset)
+        dbg("ADSET_AFTER_MUTATION", adset)
     except Exception as e:
         log_error("STEP 3", e)
         return
@@ -274,24 +273,22 @@ def main() -> None:
             return
 
         try:
-            print("STEP 5: Save video + generate ngrok URLs")
+            print("STEP 5: Save video + generate Spaces URLs")
             with open(video_path, "rb") as f:
                 upload_file = UploadFile(filename=video_path.name, file=f)
-                media = save_ad_media(upload_file)
-            log_response("STEP 5 save_ad_media()", media)
+                media = media_mgr.save_ad_media(upload_file)
+            log_response("STEP 5 media_mgr.save_ad_media()", media)
 
             video_url = media.get("video_url")
             thumbnail_url = media.get("thumbnail_url") or ""
             if not video_url:
-                raise ValueError("Ngrok video_url not returned correctly")
-            print(f"Video URL: {video_url}")
-            print(f"Thumbnail URL: {thumbnail_url}")
+                raise ValueError("Spaces video_url not returned correctly")
         except Exception as e:
             log_error("STEP 5", e)
             return
 
         try:
-            print("STEP 6: Upload video to Meta")
+            print("STEP 6: Upload video to Meta (hosted URL)")
             vid = ads.upload_ad_video(adset_index=INDEX, video_url=video_url)
             log_response("STEP 6 upload_ad_video()", {"video_id": vid})
         except Exception as e:
@@ -363,41 +360,38 @@ def main() -> None:
                 if not is_image_path(pp):
                     raise ValueError(f"Carousel images only. Not an image: {p}")
                 valid_image_paths.append(pp)
+
             log_response("STEP 4 carousel_paths", [str(p) for p in valid_image_paths])
+            dbg("CAROUSEL_IMAGE_PATHS", [str(p) for p in valid_image_paths])
         except Exception as e:
             log_error("STEP 4", e)
             return
 
         try:
             print("STEP 5: Upload carousel images to Meta (multipart local files)")
-            hashes: list[str] = []
-            for i, p in enumerate(valid_image_paths, start=1):
-                try:
-                    h = ads.upload_ad_image(adset_index=INDEX, image_path=str(p))
-                    hashes.append(h)
-                    print(f"  uploaded {i}/{len(valid_image_paths)} -> {h}")
-                except Exception as inner:
-                    raise RuntimeError(f"Failed uploading carousel image {p.name}: {inner}") from inner
+            hashes = ads.upload_ad_images(adset_index=INDEX, image_paths=[str(p) for p in valid_image_paths])
             log_response("STEP 5 carousel_image_hashes", hashes)
+            dbg("CAROUSEL_IMAGE_HASHES_FINAL", hashes)
         except Exception as e:
             log_error("STEP 5", e)
             return
 
         try:
-            print("STEP 6: Create IG carousel ad creative + paid ad (via mixed wrapper)")
-            child_attachments = [
-                {"name": f"Card {i}", "link": final_link, "image_hash": h}
-                for i, h in enumerate(hashes, start=1)
-            ]
+            print("STEP 6: Create IG carousel ad creative + paid ad (OLD impl)")
+            # IMPORTANT CHANGE:
+            # We pass child_attachments (old style), NOT kind/items, and no interactive_components_spec.
+            child_attachments = [{"name": f"Card {i}", "link": final_link, "image_hash": h} for i, h in enumerate(hashes, start=1)]
 
-            ad_result = ads.create_paid_ig_mixed_carousel_ad(
+            dbg("CAROUSEL_CREATE_INPUT_OLD", {"child_attachments": child_attachments, "link_url": final_link})
+
+            ad_result = ads.create_paid_ig_homogeneous_carousel_ad(
                 adset_index=INDEX,
                 ad_name=title,
                 child_attachments=child_attachments,
                 status=AD_STATUS,
                 link_url=final_link,
             )
-            log_response("STEP 6 create_paid_ig_mixed_carousel_ad()", ad_result)
+            log_response("STEP 6 create_paid_ig_homogeneous_carousel_ad()", ad_result)
         except Exception as e:
             log_error("STEP 6", e)
             return
@@ -417,6 +411,7 @@ def main() -> None:
                     raise ValueError(f"Unsupported carousel item type (image/video only): {p}")
                 valid_media_paths.append(pp)
             log_response("STEP 4 carousel_media_paths", [str(p) for p in valid_media_paths])
+            dbg("CAROUSEL_MEDIA_PATHS", [str(p) for p in valid_media_paths])
         except Exception as e:
             log_error("STEP 4", e)
             return
@@ -426,51 +421,43 @@ def main() -> None:
             child_attachments: list[dict] = []
 
             for i, p in enumerate(valid_media_paths, start=1):
-                try:
-                    if is_image_path(p):
-                        h = ads.upload_ad_image(adset_index=INDEX, image_path=str(p))
-                        child_attachments.append({"name": f"Card {i}", "link": final_link, "image_hash": h})
-                        print(f"  uploaded image {i}/{len(valid_media_paths)} -> {h}")
+                if is_image_path(p):
+                    h = ads.upload_ad_image(adset_index=INDEX, image_path=str(p))
+                    child_attachments.append({"name": f"Card {i}", "link": final_link, "image_hash": h})
+                    dbg("CAROUSEL_CHILD_ADD_IMAGE", {"i": i, "path": str(p), "image_hash": h, "child_attachments": child_attachments})
+                else:
+                    # video -> Spaces upload -> hosted URL -> Meta upload -> thumbnail -> upload thumb -> image_hash
+                    with open(p, "rb") as f:
+                        upload_file = UploadFile(filename=p.name, file=f)
+                        media = media_mgr.save_ad_media(upload_file)
 
-                    else:
-                        with open(p, "rb") as f:
-                            upload_file = UploadFile(filename=p.name, file=f)
-                            media = save_ad_media(upload_file)
+                    video_url = media.get("video_url")
+                    thumb_url = media.get("thumbnail_url")
+                    if not video_url:
+                        raise RuntimeError("No video_url from media_mgr.save_ad_media")
+                    if not thumb_url:
+                        raise RuntimeError("No thumbnail_url from media_mgr.save_ad_media")
 
-                        video_url = media.get("video_url")
-                        thumb_url = media.get("thumbnail_url")
-                        if not video_url:
-                            raise RuntimeError("No video_url from save_ad_media")
-                        if not thumb_url:
-                            raise RuntimeError("No thumbnail_url from save_ad_media")
+                    vid = ads.upload_ad_video(adset_index=INDEX, video_url=video_url)
 
-                        vid = ads.upload_ad_video(adset_index=INDEX, video_url=video_url)
+                    thumb_tmp_path = download_url_to_tempfile(thumb_url, suffix=".jpg")
+                    thumb_hash = ads.upload_ad_image(adset_index=INDEX, image_path=thumb_tmp_path)
 
-                        # Convert thumb_url -> local file -> upload_ad_image(image_path=...)
-                        thumb_tmp_path = download_url_to_tempfile(thumb_url, suffix=".jpg")
-                        thumb_hash = ads.upload_ad_image(adset_index=INDEX, image_path=thumb_tmp_path)
-
-                        child_attachments.append(
-                            {
-                                "name": f"Card {i}",
-                                "link": final_link,
-                                "video_id": vid,
-                                "image_hash": thumb_hash,
-                            }
-                        )
-                        print(f"  uploaded video {i}/{len(valid_media_paths)} -> {vid} (thumb_hash={thumb_hash})")
-
-                except Exception as inner:
-                    raise RuntimeError(f"Failed uploading carousel media {p.name}: {inner}") from inner
+                    child_attachments.append(
+                        {"name": f"Card {i}", "link": final_link, "video_id": vid, "image_hash": thumb_hash}
+                    )
+                    dbg("CAROUSEL_CHILD_ADD_VIDEO", {"i": i, "path": str(p), "video_id": vid, "thumb_hash": thumb_hash, "child_attachments": child_attachments})
 
             log_response("STEP 5 child_attachments", child_attachments)
-
+            dbg("CAROUSEL_CHILD_ATTACHMENTS_FINAL", child_attachments)
         except Exception as e:
             log_error("STEP 5", e)
             return
 
         try:
-            print("STEP 6: Create IG mixed carousel creative + paid ad")
+            print("STEP 6: Create IG mixed carousel creative + paid ad (OLD impl)")
+            dbg("CAROUSEL_MIXED_CREATE_INPUT", {"child_attachments": child_attachments, "link_url": final_link})
+
             ad_result = ads.create_paid_ig_mixed_carousel_ad(
                 adset_index=INDEX,
                 ad_name=title,
