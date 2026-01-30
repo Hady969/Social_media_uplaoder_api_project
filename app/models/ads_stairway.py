@@ -521,85 +521,155 @@ class AdsStairway:
     # =========================
     # CAROUSEL CREATIVES (OLD UNIFIED)
     # =========================
+    
+    # --- Add these helper functions inside AdsStairway (near _dbg / _post_form) ---
+
+    @staticmethod
+    def _safe_json_loads(s: str):
+        try:
+            return json.loads(s)
+        except Exception:
+            return {"_raw": s}
+
+    def _dbg_request_packet(self, tag: str, url: str, payload: dict) -> None:
+        """
+        Logs EXACTLY what you're sending to requests.post(...).
+        - If you use form payload (data=), it prints keys + parsed object_story_spec.
+        - If you use json payload (json=), it prints the dict directly.
+        """
+        pkt = {"url": url}
+
+        # copy without mutating original
+        p = dict(payload or {})
+        pkt["payload_keys"] = sorted(list(p.keys()))
+
+        # show tokens safely
+        if "access_token" in p:
+            tok = str(p["access_token"])
+            pkt["access_token_preview"] = tok[:8] + "..." + tok[-6:] if len(tok) > 20 else tok
+
+        # decode object_story_spec if it's a JSON string
+        if "object_story_spec" in p:
+            oss = p["object_story_spec"]
+            if isinstance(oss, str):
+                pkt["object_story_spec_is_str"] = True
+                pkt["object_story_spec_parsed"] = self._safe_json_loads(oss)
+            else:
+                pkt["object_story_spec_is_str"] = False
+                pkt["object_story_spec_value"] = oss
+
+        # decode degrees_of_freedom_spec if present
+        if "degrees_of_freedom_spec" in p:
+            dof = p["degrees_of_freedom_spec"]
+            if isinstance(dof, str):
+                pkt["degrees_of_freedom_spec_parsed"] = self._safe_json_loads(dof)
+            else:
+                pkt["degrees_of_freedom_spec_value"] = dof
+
+        self._dbg(tag, pkt)
+
+    def _dbg_carousel_counts(self, tag: str, object_story_spec: dict) -> None:
+        """
+        Logs child_attachments count and whether any interactive_components_spec exists anywhere.
+        This is specifically to diagnose mismatch errors.
+        """
+        link_data = (object_story_spec or {}).get("link_data") or {}
+        cards = link_data.get("child_attachments") or []
+        has_interactive_top = "interactive_components_spec" in (object_story_spec or {})
+        has_interactive_link = "interactive_components_spec" in link_data
+
+        self._dbg(tag, {
+            "child_attachments_count": len(cards),
+            "child_attachments_preview": cards[:2],
+            "has_interactive_components_spec_top_level": has_interactive_top,
+            "has_interactive_components_spec_in_link_data": has_interactive_link,
+            "object_story_spec_keys": sorted(list((object_story_spec or {}).keys())),
+            "link_data_keys": sorted(list(link_data.keys())) if isinstance(link_data, dict) else type(link_data).__name__,
+        })
+
+
+    # --- Then, in the WORKING create_ig_carousel_ad_creative (the json= version), add these prints ---
+
     def create_ig_carousel_ad_creative(
         self,
         adset_index: int,
         ad_name: str,
-        child_attachments: list[dict],
-        link_url: str,
+        image_hashes: list[str],
+        link_url: str | None = None,
     ) -> str:
-        """
-        Unified OLD carousel creative API:
-          object_story_spec.link_data.child_attachments
-
-        Works for:
-          - images-only: card has image_hash
-          - mixed: video card has video_id + image_hash (thumb hash)
-          - videos-only possible if each card has video_id + image_hash thumb
-
-        IMPORTANT:
-          - form encoding via _post_form
-          - instagram_user_id key
-          - NO interactive_components_spec (prevents mismatch error)
-        """
         adset = self.adsets[adset_index]
-        self._dbg("carousel.create_old.input", {"child_attachments": child_attachments, "link_url": link_url})
 
-        cover_hash, cards = self._normalize_carousel_attachments(child_attachments, link_url)
+        if not image_hashes or len(image_hashes) < 2:
+            raise Exception("Carousel requires at least 2 image hashes")
+
+        if len(set(image_hashes)) != len(image_hashes):
+            print("[WARN] Duplicate image hashes detected in carousel. Consider using different images.")
+
+        final_link = link_url or getattr(adset, "link", None) or "https://www.instagram.com/"
+        message = getattr(adset, "title", None) or ad_name
+
+        child_attachments = [{"image_hash": h, "link": final_link} for h in image_hashes]
 
         url = f"https://graph.facebook.com/{self.graph_version}/{adset.ad_account_id}/adcreatives"
 
-        object_story_spec = {
-            "page_id": str(self.page_id),
-            "instagram_user_id": str(self.instagram_actor_id),
-            "link_data": {
-                "image_hash": cover_hash,
-                "link": link_url,
-                "name": ad_name,
-                "child_attachments": cards,
-            },
-        }
-
         payload = {
             "name": ad_name,
-            "object_story_spec": json.dumps(object_story_spec),
-            # Force opt-out of “standard enhancements” / creative add-ons
-            "degrees_of_freedom_spec": json.dumps({
-                "creative_features_spec": {
-                    "standard_enhancements": {"enroll_status": "OPT_OUT"}
-                }
-            }),
+            "object_story_spec": {
+                "page_id": self.page_id,
+                "instagram_user_id": self.instagram_actor_id,
+                "link_data": {
+                    "link": final_link,
+                    "message": message,
+                    "child_attachments": child_attachments,
+                    "multi_share_optimized": False,
+                    "multi_share_end_card": False,
+                },
+            },
             "access_token": self.user_access_token,
         }
 
+        # ---- DEBUG: show structure + counts right before sending ----
+        self._dbg("carousel.working.payload.summary", {
+            "ad_name": ad_name,
+            "final_link": final_link,
+            "image_hashes_count": len(image_hashes),
+            "image_hashes_preview": image_hashes[:3],
+        })
+        self._dbg_carousel_counts("carousel.working.object_story_spec.counts", payload["object_story_spec"])
+        self._dbg_request_packet("carousel.working.request.packet", url, payload)
+        # ------------------------------------------------------------
 
-        self._dbg("carousel.create_old.request", {"url": url, "payload": payload, "object_story_spec": object_story_spec})
-        result = self._post_form(url, payload)
-        self._dbg("carousel.create_old.response", result)
+        resp = requests.post(url, json=payload)
+        try:
+            result = resp.json()
+        except Exception:
+            result = {"_raw": resp.text}
+
+        # ---- DEBUG: show HTTP and response ----
+        self._dbg("carousel.working.http", {"status_code": resp.status_code})
+        self._dbg("carousel.working.response", result)
+        # --------------------------------------
 
         if "error" in result:
             raise Exception(result["error"])
-        return str(result["id"])
-        
+        return result["id"]
 
-    # =========================
-    # CAROUSEL ADS (UNIFIED OLD)
-    # =========================
-    def create_paid_ig_carousel_ad(
+
+    # --- And in create_paid_ig_homogeneous_carousel_ad add a final debug before creating the ad ---
+
+    def create_paid_ig_homogeneous_carousel_ad(
         self,
         adset_index: int,
         ad_name: str,
-        child_attachments: list[dict],
+        image_hashes: list[str],
         status: MetaStatus = "PAUSED",
         link_url: str | None = None,
-    ) -> dict:
-        final_link = link_url or "https://www.instagram.com/"
-
+    ):
         creative_id = self.create_ig_carousel_ad_creative(
             adset_index=adset_index,
             ad_name=ad_name,
-            child_attachments=child_attachments,
-            link_url=final_link,
+            image_hashes=image_hashes,
+            link_url=link_url,
         )
 
         adset = self.adsets[adset_index]
@@ -607,15 +677,33 @@ class AdsStairway:
 
         payload = {
             "name": ad_name,
-            "adset_id": str(adset.adset_id),
-            "creative": json.dumps({"creative_id": creative_id}),
+            "adset_id": adset.adset_id,
+            "creative": {"creative_id": creative_id},
             "status": normalize_status(status),
             "access_token": self.user_access_token,
         }
 
-        self._dbg("ad.create.carousel_old.request", {"url": url, "payload": payload})
-        result = self._post_form(url, payload)
-        self._dbg("ad.create.carousel_old.response", result)
+        # ---- DEBUG: ad create packet ----
+        self._dbg("carousel.working.ad_create.payload", {
+            "url": url,
+            "payload": {
+                "name": payload["name"],
+                "adset_id": payload["adset_id"],
+                "creative": payload["creative"],
+                "status": payload["status"],
+                "access_token_preview": str(payload["access_token"])[:8] + "...",
+            }
+        })
+        # --------------------------------
+
+        resp = requests.post(url, json=payload)
+        try:
+            result = resp.json()
+        except Exception:
+            result = {"_raw": resp.text}
+
+        self._dbg("carousel.working.ad_create.http", {"status_code": resp.status_code})
+        self._dbg("carousel.working.ad_create.response", result)
 
         if "error" in result:
             raise Exception(result["error"])
@@ -623,28 +711,126 @@ class AdsStairway:
         adset.ad_id = result["id"]
         return {"ad_id": adset.ad_id, "creative_id": creative_id}
 
-    # =========================
-    # COMPAT WRAPPERS (MATCH YOUR PIPELINE)
-    # =========================
-    def create_paid_ig_homogeneous_carousel_ad(
-        self,
-        adset_index: int,
-        ad_name: str,
-        child_attachments: list[dict],
-        status: MetaStatus = "PAUSED",
-        link_url: str | None = None,
-    ) -> dict:
-        """
-        Images-only carousel wrapper (uses unified old child_attachments API).
-        """
-        return self.create_paid_ig_carousel_ad(
-            adset_index=adset_index,
-            ad_name=ad_name,
-            child_attachments=child_attachments,
-            status=status,
-            link_url=link_url,
-        )
 
+        # =========================
+        # COMPAT WRAPPERS (MATCH YOUR PIPELINE)
+
+
+    def create_paid_ig_mixed_carousel_ad_json(
+    self,
+    adset_index: int,
+    ad_name: str,
+    child_attachments: list[dict],
+    status: MetaStatus = "PAUSED",
+    link_url: Optional[str] = None,
+) -> dict:
+            adset = self.adsets[adset_index]
+
+            if not child_attachments or len(child_attachments) < 2:
+                raise Exception("Mixed carousel requires at least 2 cards")
+
+            final_link = (link_url or getattr(adset, "link", None) or "https://www.instagram.com/").strip()
+            message = getattr(adset, "title", None) or ad_name
+
+            # -------- normalize + validate cards --------
+            cards: list[dict] = []
+            for i, att in enumerate(child_attachments, start=1):
+                if not isinstance(att, dict):
+                    raise Exception(f"child_attachments[{i}] must be dict")
+
+                typ = (att.get("type") or "").strip().lower()
+                link = (att.get("link") or "").strip() or final_link
+
+                img_hash = (att.get("image_hash") or "").strip()
+                vid = (att.get("video_id") or "").strip()
+
+                if typ not in {"image", "video"}:
+                    # allow "implicit typing" for convenience
+                    typ = "video" if vid else "image"
+
+                if typ == "image":
+                    if not img_hash:
+                        raise Exception(f"child_attachments[{i}] image card missing image_hash")
+                    card = {"link": link, "image_hash": img_hash}
+
+                else:  # video
+                    if not vid:
+                        raise Exception(f"child_attachments[{i}] video card missing video_id")
+                    if not img_hash:
+                        raise Exception(
+                            f"child_attachments[{i}] video card missing thumbnail image_hash "
+                            "(upload thumbnail via upload_ad_image and pass its hash)"
+                        )
+                    # IMPORTANT: keep thumb image_hash even for video cards
+                    card = {"link": link, "video_id": vid, "image_hash": img_hash}
+
+                cards.append(card)
+
+            # Debug: show what we will send
+            self._dbg("carousel.mixed.json.cards", {
+                "count": len(cards),
+                "preview": cards[:3],
+            })
+
+            # -------- create creative (JSON) --------
+            creative_url = f"https://graph.facebook.com/{self.graph_version}/{adset.ad_account_id}/adcreatives"
+
+            object_story_spec = {
+                "page_id": str(self.page_id),
+                "instagram_user_id": str(self.instagram_actor_id),
+                "link_data": {
+                    "link": final_link,
+                    "message": message,
+                    "child_attachments": cards,
+                    "multi_share_optimized": False,
+                    "multi_share_end_card": False,
+                },
+            }
+
+            creative_payload = {
+                "name": ad_name,
+                "object_story_spec": object_story_spec,
+                "access_token": self.user_access_token,
+            }
+
+            self._dbg("carousel.mixed.json.creative.request", {
+                "url": creative_url,
+                "payload_keys": list(creative_payload.keys()),
+                "object_story_spec": object_story_spec,
+            })
+
+            creative_resp = requests.post(creative_url, json=creative_payload)
+            self._dbg("carousel.mixed.json.creative.http", {"status_code": creative_resp.status_code})
+            creative = creative_resp.json()
+            self._dbg("carousel.mixed.json.creative.response", creative)
+
+            if "error" in creative:
+                raise Exception(creative["error"])
+
+            creative_id = str(creative["id"])
+
+            # -------- create ad (JSON) --------
+            ad_url = f"https://graph.facebook.com/{self.graph_version}/{adset.ad_account_id}/ads"
+            ad_payload = {
+                "name": ad_name,
+                "adset_id": str(adset.adset_id),
+                "creative": {"creative_id": creative_id},
+                "status": normalize_status(status),
+                "access_token": self.user_access_token,
+            }
+
+            self._dbg("carousel.mixed.json.ad.request", {"url": ad_url, "payload": {**ad_payload, "access_token": "REDACTED"}})
+            ad_resp = requests.post(ad_url, json=ad_payload)
+            self._dbg("carousel.mixed.json.ad.http", {"status_code": ad_resp.status_code})
+            ad = ad_resp.json()
+            self._dbg("carousel.mixed.json.ad.response", ad)
+
+            if "error" in ad:
+                raise Exception(ad["error"])
+
+            adset.ad_id = str(ad["id"])
+            return {"ad_id": adset.ad_id, "creative_id": creative_id}
+    
     def create_paid_ig_mixed_carousel_ad(
         self,
         adset_index: int,

@@ -383,11 +383,12 @@ def main() -> None:
             child_attachments = [{"name": f"Card {i}", "link": final_link, "image_hash": h} for i, h in enumerate(hashes, start=1)]
 
             dbg("CAROUSEL_CREATE_INPUT_OLD", {"child_attachments": child_attachments, "link_url": final_link})
+         
 
             ad_result = ads.create_paid_ig_homogeneous_carousel_ad(
                 adset_index=INDEX,
                 ad_name=title,
-                child_attachments=child_attachments,
+                image_hashes=hashes,
                 status=AD_STATUS,
                 link_url=final_link,
             )
@@ -458,7 +459,7 @@ def main() -> None:
             print("STEP 6: Create IG mixed carousel creative + paid ad (OLD impl)")
             dbg("CAROUSEL_MIXED_CREATE_INPUT", {"child_attachments": child_attachments, "link_url": final_link})
 
-            ad_result = ads.create_paid_ig_mixed_carousel_ad(
+            ad_result = ads.create_paid_ig_mixed_carousel_ad_json(
                 adset_index=INDEX,
                 ad_name=title,
                 child_attachments=child_attachments,
