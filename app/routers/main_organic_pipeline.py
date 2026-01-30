@@ -9,10 +9,7 @@ from pathlib import Path
 
 from fastapi import UploadFile
 
-from app.routers.ngrok_media_manager import (
-    save_organic_video,
-    save_organic_image,
-)
+from app.utils.spaces_uploader import SpacesUploader
 from app.routers.organic_poster import (
     organic_posts,
     upload_video_instagram,
@@ -34,6 +31,8 @@ DEFAULT_TITLE = "AI is changing everything 🤖"
 CLIENT_ID = os.environ["CLIENT_ID"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 FERNET_KEY = os.environ["TOKEN_ENCRYPTION_KEY"]
+
+uploader = SpacesUploader()
 
 
 # ---------------- PROMPTS ----------------
@@ -98,16 +97,16 @@ def main() -> None:
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         with open(video_path, "rb") as f:
-            upload_file = UploadFile(
-                filename=os.path.basename(video_path),
-                file=f,
+            upload_file = UploadFile(filename=os.path.basename(video_path), file=f)
+
+            video_url = uploader.upload_organic_video(
+                fileobj=upload_file.file,
+                filename=upload_file.filename,
+                content_type=upload_file.content_type or "video/mp4",
             )
-            organic_post = save_organic_video(title, upload_file)
 
-        if organic_post.video_url is None:
-            raise RuntimeError("save_organic_video() returned no video_url")
-
-        print(f"[ngrok] Video URL: {organic_post.video_url}")
+        organic_post = OrganicPost(title=title, video_url=video_url)
+        print(f"[spaces] Video URL: {organic_post.video_url}")
 
         organic_posts.append(organic_post)
         idx = len(organic_posts) - 1
@@ -122,16 +121,16 @@ def main() -> None:
             raise FileNotFoundError(f"Image not found: {image_path}")
 
         with open(image_path, "rb") as f:
-            upload_file = UploadFile(
-                filename=os.path.basename(image_path),
-                file=f,
+            upload_file = UploadFile(filename=os.path.basename(image_path), file=f)
+
+            image_url = uploader.upload_organic_image(
+                fileobj=upload_file.file,
+                filename=upload_file.filename,
+                content_type=upload_file.content_type or "image/jpeg",
             )
-            organic_post = save_organic_image(title, upload_file)
 
-        if organic_post.image_url is None:
-            raise RuntimeError("save_organic_image() returned no image_url")
-
-        print(f"[ngrok] Image URL: {organic_post.image_url}")
+        organic_post = OrganicPost(title=title, image_url=image_url)
+        print(f"[spaces] Image URL: {organic_post.image_url}")
 
         organic_posts.append(organic_post)
         idx = len(organic_posts) - 1
@@ -157,35 +156,33 @@ def main() -> None:
 
             ext = Path(path).suffix.lower()
             if not (_ext_is_image(ext) or _ext_is_video(ext)):
-                print("Unsupported file type. Use images (.jpg/.png/.webp) or videos (.mp4/.mov/.m4v).")
+                print("Unsupported file type.")
                 continue
 
             with open(path, "rb") as f:
-                upload_file = UploadFile(
-                    filename=os.path.basename(path),
-                    file=f,
-                )
+                upload_file = UploadFile(filename=os.path.basename(path), file=f)
 
                 if _ext_is_video(ext):
-                    part = save_organic_video("", upload_file)
-                    video_url = part.video_url
-                    if video_url is None:
-                        raise RuntimeError("save_organic_video() returned no video_url")
-                    items.append(CarouselItem(type="video", url=video_url))
+                    url = uploader.upload_organic_video(
+                        fileobj=upload_file.file,
+                        filename=upload_file.filename,
+                        content_type=upload_file.content_type or "video/mp4",
+                    )
+                    items.append(CarouselItem(type="video", url=url))
+                    print(f"[spaces] Carousel video: {url}")
                 else:
-                    part = save_organic_image("", upload_file)
-                    image_url = part.image_url
-                    if image_url is None:
-                        raise RuntimeError("save_organic_image() returned no image_url")
-                    items.append(CarouselItem(type="image", url=image_url))
+                    url = uploader.upload_organic_image(
+                        fileobj=upload_file.file,
+                        filename=upload_file.filename,
+                        content_type=upload_file.content_type or "image/jpeg",
+                    )
+                    items.append(CarouselItem(type="image", url=url))
+                    print(f"[spaces] Carousel image: {url}")
 
         if len(items) < 2:
             raise RuntimeError("Carousel requires at least 2 items.")
 
-        organic_post = OrganicPost(
-            title=title,
-            carousel_items=items,
-        )
+        organic_post = OrganicPost(title=title, carousel_items=items)
 
         organic_posts.append(organic_post)
         idx = len(organic_posts) - 1

@@ -162,18 +162,23 @@ class AdsStairway:
 
     # ---------------- ADSET ----------------
     def create_adset(
-        self,
-        index: int,
-        status: MetaStatus = "PAUSED",
-        asset_type: AssetType = "video",
-        daily_budget: int | None = None,
-        title: str | None = None,
-        link: str | None = None,
-    ):
+    self,
+    index: int,
+    status: MetaStatus = "PAUSED",
+    asset_type: AssetType = "video",
+    daily_budget: int | None = None,
+    title: str | None = None,
+    link: str | None = None,
+    optimization_goal: str | None = None,  # NEW
+):
         """
         asset_type:
         - "video": includes reels placements
         - "image": avoids reels placements (more compatible)
+
+        optimization_goal:
+        - if provided, overrides campaign.optimization_goal (and defaults)
+        - typical values: "REACH", "IMPRESSIONS", "LINK_CLICKS", "LANDING_PAGE_VIEWS", etc.
         """
         if index >= len(self.created_campaigns):
             raise Exception("Invalid campaign index")
@@ -183,6 +188,9 @@ class AdsStairway:
 
         ig_positions = ["stream", "story", "reels"] if asset_type == "video" else ["stream", "story"]
         final_budget = int(daily_budget) if daily_budget is not None else int(campaign.daily_budget)
+
+        # NEW: resolve optimization_goal
+        og = (optimization_goal or getattr(campaign, "optimization_goal", None) or "REACH").strip().upper()
 
         promoted_object = {"page_id": str(campaign.page_id)}
         targeting = {
@@ -197,7 +205,7 @@ class AdsStairway:
             "campaign_id": str(campaign.campaign_id),
             "daily_budget": str(final_budget),
             "billing_event": "IMPRESSIONS",
-            "optimization_goal": str(campaign.optimization_goal),
+            "optimization_goal": og,  # NEW (was: str(campaign.optimization_goal))
             "status": normalize_status(status),
             "promoted_object": json.dumps(promoted_object),
             "targeting": json.dumps(targeting),
@@ -227,24 +235,6 @@ class AdsStairway:
         self.adsets.append(adset)
         return adset
 
-    # ---------------- VIDEO (SINGLE) ----------------
-    def upload_ad_video(self, adset_index: int, video_url: str):
-        """
-        Upload a hosted (public) video URL to the IG page video endpoint.
-        """
-        adset = self.adsets[adset_index]
-        url = f"https://graph.facebook.com/{self.graph_version}/{self.page_id}/videos"
-        payload = {"file_url": video_url, "access_token": self.page_access_token}
-
-        self._dbg("upload_ad_video.request", {"url": url, "payload": payload})
-        result = requests.post(url, data=payload).json()
-        self._dbg("upload_ad_video.response", result)
-
-        if "error" in result:
-            raise Exception(result["error"])
-
-        adset.video_id = result["id"]
-        return adset.video_id
 
     def create_paid_ig_ad(self, adset_index: int, ad_name: str, thumbnail_url: str, status: MetaStatus):
         """

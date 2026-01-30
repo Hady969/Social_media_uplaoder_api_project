@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import time
-import mimetypes
 import requests
 from typing import List, Optional
 
@@ -15,22 +14,57 @@ from app.routers.meta_token_db_reader import MetaTokenDbReader
 router = APIRouter()
 GRAPH_API_VERSION = "v17.0"
 
-# In-memory list to store organic posts (kept for backward compatibility)
+# In-memory list (kept for backward compatibility with your pipeline)
 organic_posts: List[OrganicPost] = []
 
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
 
+# ---------------------------------------------------------------------
+# URL NORMALIZATION
+# ---------------------------------------------------------------------
+# With DigitalOcean Spaces, URLs are already public.
+# This helper is kept for safety / backward compatibility.
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("DROPLET_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+NGROK_BASE_URL = (os.getenv("NGROK_BASE_URL") or "").strip().rstrip("/")
+
+
+def _normalize_public_media_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return url
+
+    u = str(url).strip()
+    if not u:
+        return u
+
+    # Already a public URL (Spaces/CDN/etc.)
+    if u.startswith("http://") or u.startswith("https://"):
+        if NGROK_BASE_URL and PUBLIC_BASE_URL and u.startswith(NGROK_BASE_URL):
+            return PUBLIC_BASE_URL + u[len(NGROK_BASE_URL):]
+        return u
+
+    # Relative/local fallback (should not happen with Spaces)
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="PUBLIC_BASE_URL is not set and a non-public media URL was provided.",
+        )
+
+    if u.startswith("/"):
+        return f"{PUBLIC_BASE_URL}{u}"
+    return f"{PUBLIC_BASE_URL}/{u}"
+
+
+# ---------------------------------------------------------------------
+# META HELPERS
+# ---------------------------------------------------------------------
 def _load_page_access_token_and_ig_user_id(
     client_id: str,
     page_id: str,
     database_url: str,
     fernet_key: str,
 ) -> tuple[str, str]:
-    """
-    Returns: (page_access_token, instagram_actor_id)
-    """
     reader = MetaTokenDbReader(database_url=database_url, fernet_key=fernet_key)
 
     page_token_row = reader.get_active_page_token(client_id=client_id, page_id=page_id)
@@ -46,7 +80,7 @@ def _load_page_access_token_and_ig_user_id(
         raise HTTPException(
             status_code=400,
             detail=(
-                "No Instagram account linked to this client in DB (instagram_account table). "
+                "No Instagram account linked to this client. "
                 "Ensure the selected Page is linked to an IG Business account."
             ),
         )
@@ -77,10 +111,6 @@ def _wait_until_media_finished(creation_id: str, page_access_token: str) -> None
 
 
 def _item_type_url(item) -> tuple[str, Optional[str]]:
-    """
-    Accepts CarouselItem (pydantic model) OR dict.
-    Returns: (type, url)
-    """
     if hasattr(item, "type"):
         return (item.type or "").strip().lower(), getattr(item, "url", None)
     if isinstance(item, dict):
@@ -88,7 +118,9 @@ def _item_type_url(item) -> tuple[str, Optional[str]]:
     return "", None
 
 
-# --------------------- Upload VIDEO (REEL) ---------------------
+# ---------------------------------------------------------------------
+# VIDEO (REEL)
+# ---------------------------------------------------------------------
 @router.post("/organic/upload-video-instagram/{organic_post_index}")
 def upload_video_instagram(
     client_id: str,
@@ -101,32 +133,29 @@ def upload_video_instagram(
         raise HTTPException(status_code=404, detail="OrganicPost index out of range")
 
     post = organic_posts[organic_post_index]
+    if not post.video_url:
+        raise HTTPException(status_code=400, detail="video_url not set")
 
     page_access_token, ig_user_id = _load_page_access_token_and_ig_user_id(
-        client_id=client_id,
-        page_id=page_id,
-        database_url=database_url,
-        fernet_key=fernet_key,
+        client_id, page_id, database_url, fernet_key
     )
 
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
-    data = {
+    video_url = _normalize_public_media_url(post.video_url)
+
+    endpoint = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
+    payload = {
         "media_type": "REELS",
-        "video_url": post.video_url,
+        "video_url": video_url,
         "caption": post.title,
         "access_token": page_access_token,
     }
 
-    response = requests.post(url, data=data, timeout=60).json()
-    if "error" in response:
-        raise HTTPException(status_code=400, detail=response["error"])
+    resp = requests.post(endpoint, data=payload, timeout=60).json()
+    if "error" in resp:
+        raise HTTPException(status_code=400, detail=resp["error"])
 
-    post.creation_id = response["id"]
-    return {
-        "message": "Instagram video container created",
-        "organic_post_index": organic_post_index,
-        "creation_id": post.creation_id,
-    }
+    post.creation_id = resp["id"]
+    return {"message": "Instagram video container created", "creation_id": post.creation_id}
 
 
 @router.post("/organic/publish-video-instagram/{organic_post_index}")
@@ -142,35 +171,31 @@ def publish_video_instagram(
 
     post = organic_posts[organic_post_index]
     if not post.creation_id:
-        raise HTTPException(status_code=400, detail="Creation ID not set for this OrganicPost")
+        raise HTTPException(status_code=400, detail="Creation ID not set")
 
     page_access_token, ig_user_id = _load_page_access_token_and_ig_user_id(
-        client_id=client_id,
-        page_id=page_id,
-        database_url=database_url,
-        fernet_key=fernet_key,
+        client_id, page_id, database_url, fernet_key
     )
 
     _wait_until_media_finished(post.creation_id, page_access_token)
 
     publish_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media_publish"
-    data = {
-        "creation_id": post.creation_id,
-        "access_token": page_access_token,
-    }
-    publish_resp = requests.post(publish_url, data=data, timeout=60).json()
-    if "error" in publish_resp:
-        raise HTTPException(status_code=400, detail=publish_resp["error"])
+    resp = requests.post(
+        publish_url,
+        data={"creation_id": post.creation_id, "access_token": page_access_token},
+        timeout=60,
+    ).json()
 
-    post.instagram_post_id = publish_resp["id"]
-    return {
-        "message": "Instagram video published",
-        "organic_post_index": organic_post_index,
-        "instagram_post_id": post.instagram_post_id,
-    }
+    if "error" in resp:
+        raise HTTPException(status_code=400, detail=resp["error"])
+
+    post.instagram_post_id = resp["id"]
+    return {"message": "Instagram video published", "instagram_post_id": post.instagram_post_id}
 
 
-# --------------------- Upload PHOTO (single image) ---------------------
+# ---------------------------------------------------------------------
+# IMAGE (SINGLE)
+# ---------------------------------------------------------------------
 def upload_photo_instagram(
     client_id: str,
     page_id: str,
@@ -183,32 +208,30 @@ def upload_photo_instagram(
 
     post = organic_posts[organic_post_index]
     if not post.image_url:
-        raise HTTPException(status_code=400, detail="image_url not set for this OrganicPost")
+        raise HTTPException(status_code=400, detail="image_url not set")
 
     page_access_token, ig_user_id = _load_page_access_token_and_ig_user_id(
-        client_id=client_id,
-        page_id=page_id,
-        database_url=database_url,
-        fernet_key=fernet_key,
+        client_id, page_id, database_url, fernet_key
     )
 
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
-    data = {
-        "image_url": post.image_url,
-        "caption": post.title,
-        "access_token": page_access_token,
-    }
+    image_url = _normalize_public_media_url(post.image_url)
 
-    response = requests.post(url, data=data, timeout=60).json()
-    if "error" in response:
-        raise HTTPException(status_code=400, detail=response["error"])
+    endpoint = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
+    resp = requests.post(
+        endpoint,
+        data={
+            "image_url": image_url,
+            "caption": post.title,
+            "access_token": page_access_token,
+        },
+        timeout=60,
+    ).json()
 
-    post.creation_id = response["id"]
-    return {
-        "message": "Instagram photo container created",
-        "organic_post_index": organic_post_index,
-        "creation_id": post.creation_id,
-    }
+    if "error" in resp:
+        raise HTTPException(status_code=400, detail=resp["error"])
+
+    post.creation_id = resp["id"]
+    return {"message": "Instagram photo container created", "creation_id": post.creation_id}
 
 
 def publish_photo_instagram(
@@ -223,35 +246,31 @@ def publish_photo_instagram(
 
     post = organic_posts[organic_post_index]
     if not post.creation_id:
-        raise HTTPException(status_code=400, detail="Creation ID not set for this OrganicPost")
+        raise HTTPException(status_code=400, detail="Creation ID not set")
 
     page_access_token, ig_user_id = _load_page_access_token_and_ig_user_id(
-        client_id=client_id,
-        page_id=page_id,
-        database_url=database_url,
-        fernet_key=fernet_key,
+        client_id, page_id, database_url, fernet_key
     )
 
     _wait_until_media_finished(post.creation_id, page_access_token)
 
     publish_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media_publish"
-    data = {
-        "creation_id": post.creation_id,
-        "access_token": page_access_token,
-    }
-    publish_resp = requests.post(publish_url, data=data, timeout=60).json()
-    if "error" in publish_resp:
-        raise HTTPException(status_code=400, detail=publish_resp["error"])
+    resp = requests.post(
+        publish_url,
+        data={"creation_id": post.creation_id, "access_token": page_access_token},
+        timeout=60,
+    ).json()
 
-    post.instagram_post_id = publish_resp["id"]
-    return {
-        "message": "Instagram photo published",
-        "organic_post_index": organic_post_index,
-        "instagram_post_id": post.instagram_post_id,
-    }
+    if "error" in resp:
+        raise HTTPException(status_code=400, detail=resp["error"])
+
+    post.instagram_post_id = resp["id"]
+    return {"message": "Instagram photo published", "instagram_post_id": post.instagram_post_id}
 
 
-# --------------------- Upload CAROUSEL ---------------------
+# ---------------------------------------------------------------------
+# CAROUSEL
+# ---------------------------------------------------------------------
 def upload_carousel_instagram(
     client_id: str,
     page_id: str,
@@ -270,14 +289,12 @@ def upload_carousel_instagram(
         client_id, page_id, database_url, fernet_key
     )
 
-    child_creation_ids: list[str] = []
+    child_ids: list[str] = []
 
-    # -------------------------
-    # STEP 1 — create children
-    # -------------------------
+    # STEP 1 — children
     for idx, item in enumerate(post.carousel_items):
-        media_type = item.type.lower()
-        media_url = item.url
+        media_type, raw_url = _item_type_url(item)
+        media_url = _normalize_public_media_url(raw_url)
 
         endpoint = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
 
@@ -297,72 +314,34 @@ def upload_carousel_instagram(
         else:
             raise HTTPException(400, f"Unsupported carousel media type: {media_type}")
 
-        for attempt in range(1, 6):
-            resp = requests.post(endpoint, data=payload, timeout=90).json()
+        resp = requests.post(endpoint, data=payload, timeout=90).json()
+        if "error" in resp:
+            raise HTTPException(status_code=400, detail=resp["error"])
 
-            if "error" not in resp:
-                child_creation_ids.append(resp["id"])
-                break
+        child_ids.append(resp["id"])
 
-            err = resp["error"]
-            if err.get("is_transient"):
-                wait = attempt * 4
-                print(f"[carousel child retry {attempt}] transient error, sleeping {wait}s")
-                time.sleep(wait)
-                continue
-
-            # HARD ERROR
-            raise HTTPException(status_code=400, detail=err)
-
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to create carousel child after retries (index {idx})",
-            )
-
-    # --------------------------------------
-    # STEP 2 — wait for ALL children to finish
-    # --------------------------------------
-    for cid in child_creation_ids:
+    # STEP 2 — wait
+    for cid in child_ids:
         _wait_until_media_finished(cid, page_access_token)
 
-    # -------------------------------
-    # STEP 3 — create parent carousel
-    # -------------------------------
+    # STEP 3 — parent
     parent_endpoint = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
-    parent_payload = {
-        "media_type": "CAROUSEL",
-        "children": ",".join(child_creation_ids),
-        "caption": post.title,
-        "access_token": page_access_token,
-    }
+    parent_resp = requests.post(
+        parent_endpoint,
+        data={
+            "media_type": "CAROUSEL",
+            "children": ",".join(child_ids),
+            "caption": post.title,
+            "access_token": page_access_token,
+        },
+        timeout=90,
+    ).json()
 
-    for attempt in range(1, 6):
-        parent_resp = requests.post(parent_endpoint, data=parent_payload, timeout=90).json()
+    if "error" in parent_resp:
+        raise HTTPException(status_code=400, detail=parent_resp["error"])
 
-        if "error" not in parent_resp:
-            post.creation_id = parent_resp["id"]
-            return {
-                "message": "Instagram carousel container created",
-                "organic_post_index": organic_post_index,
-                "creation_id": post.creation_id,
-                "children": child_creation_ids,
-            }
-
-        err = parent_resp["error"]
-        if err.get("is_transient"):
-            wait = attempt * 5
-            print(f"[carousel parent retry {attempt}] transient error, sleeping {wait}s")
-            time.sleep(wait)
-            continue
-
-        raise HTTPException(status_code=400, detail=err)
-
-    raise HTTPException(
-        status_code=500,
-        detail="Failed to create carousel parent after retries",
-    )
-
+    post.creation_id = parent_resp["id"]
+    return {"message": "Instagram carousel container created", "creation_id": post.creation_id}
 
 
 def publish_carousel_instagram(
@@ -377,29 +356,23 @@ def publish_carousel_instagram(
 
     post = organic_posts[organic_post_index]
     if not post.creation_id:
-        raise HTTPException(status_code=400, detail="Creation ID not set for this OrganicPost")
+        raise HTTPException(status_code=400, detail="Creation ID not set")
 
     page_access_token, ig_user_id = _load_page_access_token_and_ig_user_id(
-        client_id=client_id,
-        page_id=page_id,
-        database_url=database_url,
-        fernet_key=fernet_key,
+        client_id, page_id, database_url, fernet_key
     )
 
     _wait_until_media_finished(post.creation_id, page_access_token)
 
     publish_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media_publish"
-    data = {
-        "creation_id": post.creation_id,
-        "access_token": page_access_token,
-    }
-    publish_resp = requests.post(publish_url, data=data, timeout=60).json()
-    if "error" in publish_resp:
-        raise HTTPException(status_code=400, detail=publish_resp["error"])
+    resp = requests.post(
+        publish_url,
+        data={"creation_id": post.creation_id, "access_token": page_access_token},
+        timeout=60,
+    ).json()
 
-    post.instagram_post_id = publish_resp["id"]
-    return {
-        "message": "Instagram carousel published",
-        "organic_post_index": organic_post_index,
-        "instagram_post_id": post.instagram_post_id,
-    }
+    if "error" in resp:
+        raise HTTPException(status_code=400, detail=resp["error"])
+
+    post.instagram_post_id = resp["id"]
+    return {"message": "Instagram carousel published", "instagram_post_id": post.instagram_post_id}
