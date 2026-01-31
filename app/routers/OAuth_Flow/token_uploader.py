@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence
 
 from app.routers.OAuth import OAuth, OAuthError
-from app.routers.meta_db_writer import MetaTokenDbWriter
+from app.routers.DB_helpers.meta_db_writer import MetaTokenDbWriter
 
 
 class TokenUploadError(Exception):

@@ -9,7 +9,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 
 from app.models.schemas import OrganicPost, CarouselItem
-from app.routers.meta_token_db_reader import MetaTokenDbReader
+from app.routers.DB_helpers.meta_token_db_reader import MetaTokenDbReader
 
 router = APIRouter()
 GRAPH_API_VERSION = "v17.0"

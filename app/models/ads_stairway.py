@@ -8,7 +8,7 @@ import requests
 from typing import List, Literal, Optional, TypedDict
 
 from app.models import schemas
-from app.routers.meta_token_db_reader import MetaTokenDbReader
+from app.routers.DB_helpers.meta_token_db_reader import MetaTokenDbReader
 
 MetaStatus = Literal["ACTIVE", "PAUSED"]
 AssetType = Literal["video", "image"]

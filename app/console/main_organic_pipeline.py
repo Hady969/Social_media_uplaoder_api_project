@@ -9,8 +9,8 @@ from pathlib import Path
 
 from fastapi import UploadFile
 
-from app.utils.spaces_uploader import SpacesUploader
-from app.routers.organic_poster import (
+from app.models.spaces_uploader import SpacesUploader
+from app.models.organic_poster import (
     organic_posts,
     upload_video_instagram,
     publish_video_instagram,
@@ -19,7 +19,7 @@ from app.routers.organic_poster import (
     upload_carousel_instagram,
     publish_carousel_instagram,
 )
-from app.routers.meta_token_db_reader import MetaTokenDbReader
+from app.routers.DB_helpers.meta_token_db_reader import MetaTokenDbReader
 from app.models.schemas import OrganicPost, CarouselItem
 
 

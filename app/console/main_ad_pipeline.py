@@ -12,8 +12,8 @@ from fastapi import UploadFile
 from dotenv import load_dotenv
 
 from app.models.ads_stairway import AdsStairway
-from app.routers.meta_token_db_reader import MetaTokenDbReader
-from app.utils.spaces_uploader import SpacesMediaManager
+from app.routers.DB_helpers.meta_token_db_reader import MetaTokenDbReader
+from app.models.spaces_uploader import SpacesMediaManager
 
 load_dotenv()
 

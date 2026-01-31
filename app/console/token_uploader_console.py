@@ -12,8 +12,8 @@ from urllib.parse import urlparse, parse_qs
 # - fetch_instagram_account_for_page
 from app.routers.OAuth import OAuth, OAuthError
 
-from app.routers.meta_db_writer import MetaTokenDbWriter
-from app.routers.token_uploader import TokenUploadError
+from app.routers.DB_helpers.meta_db_writer import MetaTokenDbWriter
+from app.routers.OAuth_Flow.token_uploader import TokenUploadError
 
 load_dotenv()
 

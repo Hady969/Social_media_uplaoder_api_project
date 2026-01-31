@@ -9,7 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 from cryptography.fernet import Fernet
 
-from app.routers.meta_token_crypto import MetaTokenCrypto
+from app.routers.DB_helpers.meta_token_crypto import MetaTokenCrypto
 
 class DbReadError(Exception):
     pass
