@@ -6,14 +6,16 @@ import json
 import traceback
 from pathlib import Path
 import tempfile
-import urllib.request
+import time
+from typing import Optional
 
+import requests
 from fastapi import UploadFile
 from dotenv import load_dotenv
 
-from app.models.ads_stairway import AdsStairway
+from app.models.ig_ads_stairway import AdsStairway
 from app.routers.DB_helpers.meta_token_db_reader import MetaTokenDbReader
-from app.models.spaces_uploader import SpacesMediaManager
+from app.models.spaces_uploader import SpacesUploader
 
 load_dotenv()
 
@@ -172,11 +174,87 @@ def prompt_carousel_paths(allow_video: bool) -> list[str]:
     return paths
 
 
-def download_url_to_tempfile(url: str, suffix: str = ".jpg") -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.close()
-    urllib.request.urlretrieve(url, tmp.name)
-    return tmp.name
+# ---------------- FIX: robust thumbnail download ----------------
+def _guess_suffix_from_url(url: str, default: str = ".jpg") -> str:
+    u = (url or "").lower()
+    if ".png" in u:
+        return ".png"
+    if ".webp" in u:
+        return ".webp"
+    if ".jpg" in u or ".jpeg" in u:
+        return ".jpg"
+    return default
+
+
+def download_url_to_tempfile(
+    url: str,
+    *,
+    suffix: Optional[str] = None,
+    retries: int = 4,
+    timeout_s: int = 30,
+    backoff_s: float = 1.25,
+) -> str:
+    """
+    Replaces urllib.request.urlretrieve which can throw ContentTooShortError on flaky networks / CDNs.
+    - Streams the response to disk
+    - Verifies Content-Length (when provided)
+    - Retries with exponential-ish backoff
+    """
+    if not url:
+        raise ValueError("download_url_to_tempfile: url is empty")
+
+    suffix = suffix or _guess_suffix_from_url(url, default=".jpg")
+
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp_path = tmp.name
+        tmp.close()
+
+        try:
+            headers = {
+                # helps some CDNs that behave differently for unknown clients
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "*/*",
+            }
+
+            with requests.get(url, stream=True, timeout=timeout_s, headers=headers) as r:
+                r.raise_for_status()
+                expected = r.headers.get("Content-Length")
+                expected_n = int(expected) if expected and expected.isdigit() else None
+
+                total = 0
+                with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 256):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        total += len(chunk)
+
+            # if server provided length, validate
+            if expected_n is not None and total != expected_n:
+                raise IOError(f"retrieval incomplete: got {total} out of {expected_n} bytes")
+
+            return tmp_path
+
+        except Exception as e:
+            last_err = e
+            # cleanup partial file
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+            if attempt < retries:
+                sleep_s = backoff_s * attempt
+                dbg("thumb.download.retry", {"attempt": attempt, "sleep_s": sleep_s, "error": repr(e)})
+                time.sleep(sleep_s)
+                continue
+
+            raise
+
+    # should never reach
+    raise last_err or RuntimeError("download failed")
 
 
 # ---------------- MAIN ----------------
@@ -213,7 +291,7 @@ def main() -> None:
         graph_version=GRAPH_API_VERSION,
     )
 
-    media_mgr = SpacesMediaManager()
+    spaces = SpacesUploader()
 
     # STEP 1
     try:
@@ -276,8 +354,8 @@ def main() -> None:
             print("STEP 5: Save video + generate Spaces URLs")
             with open(video_path, "rb") as f:
                 upload_file = UploadFile(filename=video_path.name, file=f)
-                media = media_mgr.save_ad_media(upload_file)
-            log_response("STEP 5 media_mgr.save_ad_media()", media)
+                media = spaces.save_ad_media(upload_file)
+            log_response("STEP 5 spaces.save_ad_media()", media)
 
             video_url = media.get("video_url")
             thumbnail_url = media.get("thumbnail_url") or ""
@@ -377,13 +455,12 @@ def main() -> None:
             return
 
         try:
-            print("STEP 6: Create IG carousel ad creative + paid ad (OLD impl)")
-            # IMPORTANT CHANGE:
-            # We pass child_attachments (old style), NOT kind/items, and no interactive_components_spec.
-            child_attachments = [{"name": f"Card {i}", "link": final_link, "image_hash": h} for i, h in enumerate(hashes, start=1)]
-
-            dbg("CAROUSEL_CREATE_INPUT_OLD", {"child_attachments": child_attachments, "link_url": final_link})
-         
+            print("STEP 6: Create IG carousel ad creative + paid ad")
+            child_attachments = [
+                {"name": f"Card {i}", "link": final_link, "image_hash": h}
+                for i, h in enumerate(hashes, start=1)
+            ]
+            dbg("CAROUSEL_CREATE_INPUT", {"child_attachments": child_attachments, "link_url": final_link})
 
             ad_result = ads.create_paid_ig_homogeneous_carousel_ad(
                 adset_index=INDEX,
@@ -425,29 +502,50 @@ def main() -> None:
                 if is_image_path(p):
                     h = ads.upload_ad_image(adset_index=INDEX, image_path=str(p))
                     child_attachments.append({"name": f"Card {i}", "link": final_link, "image_hash": h})
-                    dbg("CAROUSEL_CHILD_ADD_IMAGE", {"i": i, "path": str(p), "image_hash": h, "child_attachments": child_attachments})
+                    dbg(
+                        "CAROUSEL_CHILD_ADD_IMAGE",
+                        {"i": i, "path": str(p), "image_hash": h, "child_attachments": child_attachments},
+                    )
                 else:
-                    # video -> Spaces upload -> hosted URL -> Meta upload -> thumbnail -> upload thumb -> image_hash
+                    # video -> Spaces upload -> hosted URL -> Meta upload -> thumbnail download -> upload thumb -> image_hash
                     with open(p, "rb") as f:
                         upload_file = UploadFile(filename=p.name, file=f)
-                        media = media_mgr.save_ad_media(upload_file)
+                        media = spaces.save_ad_media(upload_file)
 
                     video_url = media.get("video_url")
                     thumb_url = media.get("thumbnail_url")
                     if not video_url:
-                        raise RuntimeError("No video_url from media_mgr.save_ad_media")
+                        raise RuntimeError("No video_url from spaces.save_ad_media")
                     if not thumb_url:
-                        raise RuntimeError("No thumbnail_url from media_mgr.save_ad_media")
+                        raise RuntimeError("No thumbnail_url from spaces.save_ad_media")
 
                     vid = ads.upload_ad_video(adset_index=INDEX, video_url=video_url)
 
+                    # FIXED: robust download (no urllib ContentTooShortError)
                     thumb_tmp_path = download_url_to_tempfile(thumb_url, suffix=".jpg")
-                    thumb_hash = ads.upload_ad_image(adset_index=INDEX, image_path=thumb_tmp_path)
+
+                    try:
+                        thumb_hash = ads.upload_ad_image(adset_index=INDEX, image_path=thumb_tmp_path)
+                    finally:
+                        # cleanup temp thumbnail
+                        try:
+                            os.unlink(thumb_tmp_path)
+                        except Exception:
+                            pass
 
                     child_attachments.append(
                         {"name": f"Card {i}", "link": final_link, "video_id": vid, "image_hash": thumb_hash}
                     )
-                    dbg("CAROUSEL_CHILD_ADD_VIDEO", {"i": i, "path": str(p), "video_id": vid, "thumb_hash": thumb_hash, "child_attachments": child_attachments})
+                    dbg(
+                        "CAROUSEL_CHILD_ADD_VIDEO",
+                        {
+                            "i": i,
+                            "path": str(p),
+                            "video_id": vid,
+                            "thumb_hash": thumb_hash,
+                            "child_attachments": child_attachments,
+                        },
+                    )
 
             log_response("STEP 5 child_attachments", child_attachments)
             dbg("CAROUSEL_CHILD_ATTACHMENTS_FINAL", child_attachments)
@@ -456,7 +554,7 @@ def main() -> None:
             return
 
         try:
-            print("STEP 6: Create IG mixed carousel creative + paid ad (OLD impl)")
+            print("STEP 6: Create IG mixed carousel creative + paid ad")
             dbg("CAROUSEL_MIXED_CREATE_INPUT", {"child_attachments": child_attachments, "link_url": final_link})
 
             ad_result = ads.create_paid_ig_mixed_carousel_ad_json(
@@ -466,7 +564,7 @@ def main() -> None:
                 status=AD_STATUS,
                 link_url=final_link,
             )
-            log_response("STEP 6 create_paid_ig_mixed_carousel_ad()", ad_result)
+            log_response("STEP 6 create_paid_ig_mixed_carousel_ad_json()", ad_result)
         except Exception as e:
             log_error("STEP 6", e)
             return

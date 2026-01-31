@@ -389,6 +389,45 @@ class AdsStairway:
 
         self._dbg("carousel.upload_images.output", {"adset_id": adset.adset_id, "hashes": hashes})
         return hashes
+    def upload_ad_video(self, adset_index: int, video_url: str, name: str = "Hosted Upload") -> str:
+        """
+        Upload a video to the ad account using a PUBLIC hosted URL (Spaces/CDN).
+        Returns video_id and stores it on the adset (adset.video_id) for create_paid_ig_ad().
+        """
+        adset = self.adsets[adset_index]
+        ad_account_id = adset.ad_account_id  # already "act_..."
+
+        if not (video_url or "").strip():
+            raise ValueError("video_url is required (hosted public URL).")
+
+        endpoint = f"https://graph.facebook.com/{self.graph_version}/{ad_account_id}/advideos"
+
+        payload = {
+            "access_token": self.user_access_token,
+            "name": name,
+            "file_url": video_url.strip(),   # <-- hosted URL upload
+        }
+
+        self._dbg("upload_ad_video.request", {"endpoint": endpoint, "payload": {**payload, "access_token": "REDACTED"}})
+        r = requests.post(endpoint, data=payload, timeout=120)
+
+        try:
+            result = r.json()
+        except Exception:
+            result = {"_raw": r.text}
+
+        self._dbg("upload_ad_video.response", result)
+
+        if "error" in result:
+            raise Exception(result["error"])
+
+        video_id = result.get("id")
+        if not video_id:
+            raise Exception(f"Unexpected response (no id): {result}")
+
+        # CRITICAL: create_paid_ig_ad() reads adset.video_id
+        adset.video_id = str(video_id)
+        return str(video_id)
 
     def upload_ad_video_to_account(self, adset_index: int, video_path: str) -> str:
         """

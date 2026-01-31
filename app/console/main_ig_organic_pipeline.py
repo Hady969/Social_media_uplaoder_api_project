@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import UploadFile
 
 from app.models.spaces_uploader import SpacesUploader
-from app.models.organic_poster import (
+from app.models.ig_organic_poster import (
     organic_posts,
     upload_video_instagram,
     publish_video_instagram,
