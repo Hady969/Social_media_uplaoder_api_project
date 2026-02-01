@@ -119,6 +119,48 @@ class MetaAnalyticsClient:
             "profile_picture_url": data.get("profile_picture_url"),
         }
 
+    # -------- FB Page / Account Status --------
+
+    def get_fb_page_status(self, page_id: str) -> Dict[str, Any]:
+        """
+        Returns a minimal "status snapshot" for a Facebook Page.
+        Works with a Page access token (recommended) or sometimes a User token with sufficient permissions.
+        Fields chosen are generally safe/available; if some are not available for your app, remove them.
+        """
+        fields = ",".join(
+            [
+                "id",
+                "name",
+                "link",
+                "fan_count",
+                "followers_count",
+                "is_published",
+                "verification_status",
+                "category",
+                "category_list",
+            ]
+        )
+        data = self._get(page_id, params={"fields": fields})
+        return {
+            "page_id": data.get("id"),
+            "name": data.get("name"),
+            "link": data.get("link"),
+            "fan_count": data.get("fan_count"),
+            "followers_count": data.get("followers_count"),
+            "is_published": data.get("is_published"),
+            "verification_status": data.get("verification_status"),
+            "category": data.get("category"),
+            "category_list": data.get("category_list"),
+        }
+
+    def get_fb_page_permissions(self, page_id: str) -> Dict[str, Any]:
+        """
+        Helpful for debugging why posting/insights fail.
+        Requires a Page access token; returns what the token can do on that Page.
+        """
+        data = self._get(f"{page_id}", params={"fields": "id,perms"})
+        return {"page_id": data.get("id"), "perms": data.get("perms")}
+
     # -------- Ad Accounts --------
 
     def list_my_ad_accounts(self) -> List[Dict[str, Any]]:
@@ -148,7 +190,6 @@ class MetaAnalyticsClient:
         params: Dict[str, Any] = {
             "fields": "impressions,reach,clicks,spend,ctr,cpc,cpm",
             "level": level,
-            # IMPORTANT FIX: Graph expects JSON string
             "time_range": json.dumps({"since": since, "until": until}),
             "limit": 500,
         }
@@ -156,6 +197,44 @@ class MetaAnalyticsClient:
             params["breakdowns"] = ",".join(breakdowns)
 
         return self._get(f"{ad_account_id}/insights", params=params)
+    def debug_token(
+        self,
+        input_token: Optional[str] = None,
+        app_access_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Graph /debug_token
+        Requires app_access_token = f"{META_APP_ID}|{META_APP_SECRET}"
+        Returns token validity, scopes, expiry, app/user ids.
+        """
+        if not app_access_token:
+            raise MetaAPIError("app_access_token is required (META_APP_ID|META_APP_SECRET).")
+
+        token_to_check = input_token or self.access_token
+
+        # NOTE: debug_token expects both input_token and access_token in query params.
+        # We bypass _get() because _get() always overwrites access_token with self.access_token.
+        url = f"{self.config.base_url}/{self.config.graph_api_version}/debug_token"
+        resp = requests.get(
+            url,
+            params={"input_token": token_to_check, "access_token": app_access_token},
+            timeout=self.config.timeout_s,
+        )
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise MetaAPIError(f"Non-JSON response HTTP {resp.status_code}: {resp.text}")
+
+        if resp.status_code >= 400 or "error" in data:
+            err = data.get("error", {})
+            raise MetaAPIError(
+                f"Meta API error HTTP {resp.status_code}: "
+                f"{err.get('message', data)} "
+                f"(type={err.get('type')}, code={err.get('code')}, subcode={err.get('error_subcode')})"
+            )
+
+        return data
 
 
 # ======================
@@ -166,6 +245,7 @@ class MetaAnalyticsConsole:
     """
     Uses DB-stored tokens.
     - IG profile uses PAGE token by default (fallback user token)
+    - FB Page status uses PAGE token by default (fallback user token)
     - Ads uses USER token
     """
 
@@ -178,6 +258,7 @@ class MetaAnalyticsConsole:
         self.ig_user_id: Optional[str] = None
 
         self.ig_client: Optional[MetaAnalyticsClient] = None
+        self.fb_client: Optional[MetaAnalyticsClient] = None
         self.ads_client: Optional[MetaAnalyticsClient] = None
 
     # -------- helpers --------
@@ -205,7 +286,10 @@ class MetaAnalyticsConsole:
 
         self.ig_user_id = self.db.get_instagram_actor_id_for_client(client_id)
 
-    def _load_page_or_user_token_for_ig(self, client_id: str) -> str:
+    def _load_page_or_user_token(self, client_id: str) -> str:
+        """
+        Tries Page token first (best for Page operations), then falls back to User token.
+        """
         self._load_context_from_db(client_id)
 
         if self.page_id:
@@ -219,7 +303,7 @@ class MetaAnalyticsConsole:
             tok = self.db.get_active_user_token(client_id=client_id, meta_user_id=self.meta_user_id)
             return tok.access_token
 
-        raise TokenLoadError("No page token or user token available for IG calls.")
+        raise TokenLoadError("No page token or user token available.")
 
     def _load_user_token_for_ads(self, client_id: str) -> str:
         self._load_context_from_db(client_id)
@@ -252,6 +336,10 @@ class MetaAnalyticsConsole:
             return None
         return vals or None
 
+
+    
+
+
     def _choose_ad_account(self, accounts: List[Dict[str, Any]]) -> str:
         print("\nAvailable Ad Accounts:")
         for i, a in enumerate(accounts, start=1):
@@ -271,10 +359,11 @@ class MetaAnalyticsConsole:
         assert self.client_id
 
         # Load tokens
-        ig_token = self._load_page_or_user_token_for_ig(self.client_id)
+        page_or_user_token = self._load_page_or_user_token(self.client_id)
         ads_token = self._load_user_token_for_ads(self.client_id)
 
-        self.ig_client = MetaAnalyticsClient(ig_token)
+        self.ig_client = MetaAnalyticsClient(page_or_user_token)
+        self.fb_client = MetaAnalyticsClient(page_or_user_token)
         self.ads_client = MetaAnalyticsClient(ads_token)
 
         # load ids for convenience
@@ -286,9 +375,25 @@ class MetaAnalyticsConsole:
         print("meta_user_id:", self.meta_user_id)
         print("ig_user_id:", self.ig_user_id)
 
+    def debug_token(self, input_token: Optional[str] = None, app_access_token: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Requires app_access_token = f"{META_APP_ID}|{META_APP_SECRET}"
+        Returns scopes, expiry, user/app info, etc.
+        """
+        if not app_access_token:
+            raise MetaAPIError("app_access_token is required for debug_token (META_APP_ID|META_APP_SECRET).")
+
+        token_to_check = input_token or self.access_token
+        return self._get(
+            "debug_token",
+            params={"input_token": token_to_check, "access_token": app_access_token},
+        )
+
+
     def run(self) -> None:
         self.configure()
         assert self.ig_client is not None
+        assert self.fb_client is not None
         assert self.ads_client is not None
 
         while True:
@@ -296,10 +401,11 @@ class MetaAnalyticsConsole:
             print("1) IG profile (uses DB ig_user_id if available)")
             print("2) Show ad accounts")
             print("3) Ad insights (last 30 days)")
-            print("4) Reload tokens + ids from DB")
-            print("5) Exit")
+            print("4) FB Page status (uses DB page_id if available)")
+            print("5) Reload tokens + ids from DB")
+            print("6) Exit")
 
-            choice = input("Choose (1-5): ").strip()
+            choice = input("Choose (1-6): ").strip()
 
             try:
                 if choice == "1":
@@ -336,19 +442,43 @@ class MetaAnalyticsConsole:
                     self._print_json(result)
 
                 elif choice == "4":
+                    page_id = self._prompt("FB Page id", self.page_id or "")
+                    if not page_id:
+                        raise TokenLoadError("No page_id available. Store one in DB or paste it here.")
+
+                    status = self.fb_client.get_fb_page_status(page_id)
+                    print("\n--- FB PAGE STATUS ---")
+                    self._print_json(status)
+
+                    # Optional: permissions debug
+                want_debug = self._prompt("Debug token (requires app id/secret)? (y/n)", "n").lower().startswith("y")
+                if want_debug:
+                    app_id = os.getenv("META_APP_ID_0")
+                    app_secret = os.getenv("META_APP_SECRET_0")
+                    if not app_id or not app_secret:
+                        raise TokenLoadError("Set META_APP_ID and META_APP_SECRET in env to use debug_token.")
+                    app_access_token = f"{app_id}|{app_secret}"
+                    dbg = self.fb_client.debug_token(app_access_token=app_access_token)
+                    print("\n--- TOKEN DEBUG ---")
+                    self._print_json(dbg.get("data", dbg))
+
+                elif choice == "5":
                     # reload everything
                     assert self.client_id
-                    ig_token = self._load_page_or_user_token_for_ig(self.client_id)
+                    page_or_user_token = self._load_page_or_user_token(self.client_id)
                     ads_token = self._load_user_token_for_ads(self.client_id)
-                    self.ig_client = MetaAnalyticsClient(ig_token)
+
+                    self.ig_client = MetaAnalyticsClient(page_or_user_token)
+                    self.fb_client = MetaAnalyticsClient(page_or_user_token)
                     self.ads_client = MetaAnalyticsClient(ads_token)
+
                     self._load_context_from_db(self.client_id)
                     print("Reloaded.")
                     print("page_id:", self.page_id)
                     print("meta_user_id:", self.meta_user_id)
                     print("ig_user_id:", self.ig_user_id)
 
-                elif choice == "5":
+                elif choice == "6":
                     return
 
                 else:
