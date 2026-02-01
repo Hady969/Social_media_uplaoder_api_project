@@ -92,16 +92,20 @@ class CarouselItem(BaseModel):
     type: CarouselItemType
     url: str
 
+
 class OrganicPost(BaseModel):
     title: str
 
-    # video
+    image_url: Optional[str] = None
     video_url: Optional[str] = None
+    carousel_items: Optional[List["CarouselItem"]] = None
+
     creation_id: Optional[str] = None
+
+    # existing IG fields (if you have them)
     instagram_post_id: Optional[str] = None
 
-    # image
-    image_url: Optional[str] = None
-
-    # carousel
-    carousel_items: Optional[List[CarouselItem]] = None
+    # ADD THESE:
+    facebook_post_id: Optional[str] = None
+    facebook_photo_id: Optional[str] = None
+    facebook_video_id: Optional[str] = None

@@ -1,4 +1,4 @@
-# app/routers/main_fb_organic_pipeline.py
+# app/console/main_fb_organic_pipeline.py
 from __future__ import annotations
 
 from dotenv import load_dotenv
@@ -10,6 +10,12 @@ from pathlib import Path
 from fastapi import UploadFile
 
 from app.models.spaces_uploader import SpacesUploader
+from app.routers.DB_helpers.meta_token_db_reader import MetaTokenDbReader
+from app.models.schemas import OrganicPost, CarouselItem
+from app.models.fb_organic_poster import publish_mixed_media_bundle_facebook
+
+
+# IMPORTANT: FB-only imports (no IG endpoints)
 from app.models.fb_organic_poster import (
     organic_posts,
     upload_video_facebook,
@@ -19,15 +25,12 @@ from app.models.fb_organic_poster import (
     upload_carousel_facebook,
     publish_carousel_facebook,
 )
-from app.routers.DB_helpers.meta_token_db_reader import MetaTokenDbReader
-from app.models.schemas import OrganicPost, CarouselItem
-
 
 # ---------------- CONFIG ----------------
 DEFAULT_VIDEO_PATH = r"C:\Users\User\Desktop\Ig_Reels\istockphoto-2097298327-640_adpp_is.mp4"
 DEFAULT_IMAGE_PATH = r"C:\Users\User\Pictures\example.jpg"
 DEFAULT_TITLE = "AI is changing everything 🤖"
-DEFAULT_LINK_URL = "https://example.com"  # needed for FB carousel-style feed posts
+DEFAULT_LINK_URL = "https://example.com"  # required for FB carousel feed posts
 
 CLIENT_ID = os.environ["CLIENT_ID"]
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -55,7 +58,8 @@ def prompt_asset_type() -> str:
     print("\nChoose Facebook post type:")
     print("1) Video")
     print("2) Image (Single photo)")
-    print("3) Carousel (multiple images; videos not recommended for FB carousel cards)")
+    print("3) Carousel (images only)")
+    print("4) Mixed bundle (images + videos)")
     while True:
         choice = input("> ").strip()
         if choice == "1":
@@ -64,7 +68,10 @@ def prompt_asset_type() -> str:
             return "image"
         if choice == "3":
             return "carousel"
-        print("Invalid choice. Please select 1, 2, or 3.")
+        if choice == "4":
+            return "mixed"
+        print("Invalid choice. Please select 1, 2, 3, or 4.")
+
 
 
 def _ext_is_video(ext: str) -> bool:
@@ -85,6 +92,14 @@ def main() -> None:
     if not page_id:
         raise RuntimeError("No page_id found for this client in DB.")
 
+    print("Resolved Facebook page_id:", page_id)
+    # Optional sanity: compare with IG actor id (must be different)
+    try:
+        ig_actor = reader.get_instagram_actor_id_for_client(CLIENT_ID)
+        print("Resolved Instagram actor id (for sanity):", ig_actor)
+    except Exception:
+        pass
+
     # ---------- User input ----------
     title = prompt_str("Caption / Title", DEFAULT_TITLE)
     asset_type = prompt_asset_type()
@@ -100,6 +115,7 @@ def main() -> None:
         with open(video_path, "rb") as f:
             upload_file = UploadFile(filename=os.path.basename(video_path), file=f)
 
+            # Upload to Spaces to get a PUBLIC URL (required for Graph file_url)
             video_url = uploader.upload_organic_video(
                 fileobj=upload_file.file,
                 filename=upload_file.filename,
@@ -112,6 +128,11 @@ def main() -> None:
         organic_posts.append(organic_post)
         idx = len(organic_posts) - 1
 
+        # HARD sanity: show exactly what is being called
+        print("CALLING:", upload_video_facebook.__module__, upload_video_facebook.__name__)
+        print("CALLING:", publish_video_facebook.__module__, publish_video_facebook.__name__)
+
+        # FB-only: /{page_id}/videos (NOT IG /media)
         upload_video_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY)
         publish_video_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY)
 
@@ -136,13 +157,64 @@ def main() -> None:
         organic_posts.append(organic_post)
         idx = len(organic_posts) - 1
 
+        print("CALLING:", upload_photo_facebook.__module__, upload_photo_facebook.__name__)
+        print("CALLING:", publish_photo_facebook.__module__, publish_photo_facebook.__name__)
+
         upload_photo_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY)
         publish_photo_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY)
 
-    # ================= CAROUSEL =================
-    else:
+    # ================= CAROUSEL (IMAGES ONLY) =================
+    elif asset_type == "carousel":
         print("\nCarousel setup:")
-        print("Enter paths to images. Leave empty to finish.")
+        print("Enter paths to images ONLY. Leave empty to finish.")
+
+        items: list[CarouselItem] = []
+
+        while True:
+            path = input("Media path: ").strip()
+            if not path:
+                break
+
+            if not os.path.exists(path):
+                print("File not found, try again.")
+                continue
+
+            ext = Path(path).suffix.lower()
+            if not _ext_is_image(ext):
+                print("Unsupported file type for FB carousel. Use images only (.jpg/.png/.webp).")
+                continue
+
+            with open(path, "rb") as f:
+                upload_file = UploadFile(filename=os.path.basename(path), file=f)
+
+                url = uploader.upload_organic_image(
+                    fileobj=upload_file.file,
+                    filename=upload_file.filename,
+                    content_type=upload_file.content_type or "image/jpeg",
+                )
+                items.append(CarouselItem(type="image", url=url))
+                print(f"[spaces] Carousel image: {url}")
+
+        if len(items) < 2:
+            raise RuntimeError("Carousel requires at least 2 images.")
+
+        link_url = prompt_str("Link URL for Facebook carousel post", DEFAULT_LINK_URL)
+
+        organic_post = OrganicPost(title=title, carousel_items=items)
+        organic_posts.append(organic_post)
+        idx = len(organic_posts) - 1
+
+        print("CALLING:", upload_carousel_facebook.__module__, upload_carousel_facebook.__name__)
+        print("CALLING:", publish_carousel_facebook.__module__, publish_carousel_facebook.__name__)
+
+        # publish step posts to /{page_id}/feed with is_published=true
+        upload_carousel_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY, link_url=link_url)
+        publish_carousel_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY)
+
+    # ================= MIXED (IMAGES + VIDEOS) =================
+    elif asset_type == "mixed":
+        print("\nMixed setup:")
+        print("Enter paths to images/videos. Leave empty to finish.")
 
         items: list[CarouselItem] = []
 
@@ -157,12 +229,8 @@ def main() -> None:
 
             ext = Path(path).suffix.lower()
             if not (_ext_is_image(ext) or _ext_is_video(ext)):
-                print("Unsupported file type.")
+                print("Unsupported file type. Use .jpg/.png/.webp or .mp4/.mov/.m4v")
                 continue
-
-            # For FB carousel cards: images work best; allow videos but warn
-            if _ext_is_video(ext):
-                print("Warning: FB carousel cards generally expect images; continuing anyway.")
 
             with open(path, "rb") as f:
                 upload_file = UploadFile(filename=os.path.basename(path), file=f)
@@ -174,7 +242,7 @@ def main() -> None:
                         content_type=upload_file.content_type or "video/mp4",
                     )
                     items.append(CarouselItem(type="video", url=url))
-                    print(f"[spaces] Carousel video: {url}")
+                    print(f"[spaces] Mixed video: {url}")
                 else:
                     url = uploader.upload_organic_image(
                         fileobj=upload_file.file,
@@ -182,26 +250,33 @@ def main() -> None:
                         content_type=upload_file.content_type or "image/jpeg",
                     )
                     items.append(CarouselItem(type="image", url=url))
-                    print(f"[spaces] Carousel image: {url}")
+                    print(f"[spaces] Mixed image: {url}")
 
         if len(items) < 2:
-            raise RuntimeError("Carousel requires at least 2 items.")
-
-        link_url = prompt_str("Link URL for Facebook carousel post", DEFAULT_LINK_URL)
+            raise RuntimeError("Mixed bundle requires at least 2 items total.")
 
         organic_post = OrganicPost(title=title, carousel_items=items)
         organic_posts.append(organic_post)
         idx = len(organic_posts) - 1
 
-        upload_carousel_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY, link_url=link_url)
-        publish_carousel_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY)
+        print(
+            "CALLING:",
+            publish_mixed_media_bundle_facebook.__module__,
+            publish_mixed_media_bundle_facebook.__name__,
+        )
+        result = publish_mixed_media_bundle_facebook(CLIENT_ID, str(page_id), idx, DATABASE_URL, FERNET_KEY)
+        print(result)
+
+    else:
+        raise RuntimeError(f"Unknown asset_type: {asset_type}")
 
     # ---------- Final output ----------
-    print("\n✅ Facebook organic post published successfully")
+    print("\n✅ Facebook organic post flow finished")
     try:
         print(organic_post.model_dump())
     except Exception:
         print(organic_post.dict())
+
 
 
 if __name__ == "__main__":
